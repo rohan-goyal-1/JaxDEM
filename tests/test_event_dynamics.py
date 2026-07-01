@@ -13,6 +13,8 @@ from jaxdem.utils import (
     EVENT_NONE,
     EVENT_PAIR,
     EVENT_WALL,
+    event_corrected_rollout,
+    event_corrected_step,
     event_rollout,
     event_step,
     validate_event_state,
@@ -139,6 +141,75 @@ def test_event_step_and_rollout_are_jittable():
     assert final_state.pos.shape == state.pos.shape
     assert final_system.time.shape == system.time.shape
     assert traj[2].event_type.shape[0] == 2
+
+
+def test_event_corrected_step_matches_normal_step_without_predicted_event():
+    state, system = _sphere_system(
+        [[0.0, 0.0], [5.0, 0.0]],
+        [[1.0, 0.0], [1.0, 0.0]],
+    )
+    system = jdem.System.create(
+        state.shape,
+        dt=0.25,
+        linear_integrator_type="verlet",
+        rotation_integrator_type="",
+        collider_type="",
+    )
+
+    normal_state, normal_system = system.step(state, system)
+    result = event_corrected_step(state, system)
+
+    assert int(result.correction.n_substeps) == 1
+    assert not bool(result.correction.hit)
+    assert bool(jnp.allclose(result.state.pos, normal_state.pos))
+    assert float(result.system.time) == pytest.approx(float(normal_system.time))
+
+
+def test_event_corrected_step_subdivides_after_predicted_contact():
+    state, system = _sphere_system(
+        [[0.0, 0.0], [3.0, 0.0]],
+        [[1.0, 0.0], [-1.0, 0.0]],
+    )
+    system = jdem.System.create(
+        state.shape,
+        dt=1.0,
+        linear_integrator_type="verlet",
+        rotation_integrator_type="",
+        collider_type="",
+    )
+
+    result = event_corrected_step(state, system, max_substeps=4)
+
+    assert bool(result.correction.hit)
+    assert int(result.correction.n_substeps) == 4
+    assert float(result.correction.min_substep_dt) == pytest.approx(1.0 / 6.0)
+    assert float(result.system.time) == pytest.approx(1.0)
+
+
+def test_event_corrected_rollout_is_jittable_and_accepts_clumps():
+    state = jdem.State.create(
+        pos=jnp.array([[0.0, 0.0], [1.0, 0.0]]),
+        vel=jnp.array([[0.1, 0.0], [0.1, 0.0]]),
+        rad=jnp.array([0.25, 0.25]),
+        clump_id=jnp.zeros(2, dtype=int),
+    )
+    system = jdem.System.create(
+        state.shape,
+        dt=0.1,
+        linear_integrator_type="verlet",
+        rotation_integrator_type="",
+        collider_type="",
+    )
+
+    final_state, final_system, traj = event_corrected_rollout(
+        state,
+        system,
+        n_steps=2,
+    )
+
+    assert final_state.pos.shape == state.pos.shape
+    assert final_system.time.shape == system.time.shape
+    assert traj[2].n_substeps.shape[0] == 2
 
 
 def test_validation_rejects_clumps_bonds_facets_and_overlaps():

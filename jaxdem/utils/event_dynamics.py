@@ -1,10 +1,17 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Part of the JaxDEM project - https://github.com/cdelv/JaxDEM
-"""Event-driven hard-sphere/disc dynamics utilities.
+"""Event-driven and event-corrected dynamics utilities.
 
-This module provides an explicit EDMD path for independent spherical
-particles. It deliberately does not alter :meth:`jaxdem.System.step`, whose
-contract is fixed-step, force-based DEM integration.
+This module provides two related paths:
+
+* exact EDMD for independent hard spheres/discs; and
+* a broader event-corrected wrapper that delegates to
+  :meth:`jaxdem.System.step` in adaptive substeps.
+
+The wrapper is intended for soft-particle and general JaxDEM systems where
+there is no universal analytic next-event solution. It deliberately does not
+alter :meth:`jaxdem.System.step`, whose contract is fixed-step, force-based
+DEM integration.
 """
 
 from __future__ import annotations
@@ -50,6 +57,22 @@ class EventStepResult(NamedTuple):
     state: "State"
     system: "System"
     event: Event
+
+
+class EventCorrection(NamedTuple):
+    """Diagnostics from :func:`event_corrected_step`."""
+
+    n_substeps: jax.Array
+    min_substep_dt: jax.Array
+    hit: jax.Array
+
+
+class EventCorrectedStepResult(NamedTuple):
+    """Single event-corrected fixed-step result."""
+
+    state: "State"
+    system: "System"
+    correction: EventCorrection
 
 
 def _normalize_type_name(x: Any) -> str:
@@ -162,6 +185,49 @@ def _pair_event(state: State, system: System, min_dt: jax.Array, overlap_tol: ja
         overlap_tol,
     )
     pair_times = jnp.min(times, axis=0)
+
+    iota = jnp.arange(n, dtype=int)
+    valid_by_i = jax.vmap(
+        lambda ci, bi: valid_interaction_mask(
+            ci, state.clump_id, bi, iota, system.interact_same_bond_id
+        )
+    )(state.clump_id, state.bond_id)
+    valid_pairs = (
+        (iota[:, None] < iota[None, :])
+        & (valid_by_i > 0)
+        & ~(state.fixed[:, None] & state.fixed[None, :])
+    )
+    pair_times = jnp.where(valid_pairs, pair_times, jnp.inf)
+
+    flat_idx = jnp.argmin(pair_times.reshape(-1))
+    pair_time = pair_times.reshape(-1)[flat_idx]
+    hit = jnp.isfinite(pair_time)
+    pair_i = jnp.where(hit, flat_idx // n, -1)
+    pair_j = jnp.where(hit, flat_idx % n, -1)
+    return pair_time, pair_i, pair_j
+
+
+def _generic_pair_event(
+    state: State,
+    system: System,
+    min_dt: jax.Array,
+    overlap_tol: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Approximate next sphere-bound contact for arbitrary JaxDEM systems.
+
+    This uses the domain's own displacement rule for the current image and is
+    therefore a conservative subdivision heuristic, not exact EDMD geometry for
+    every possible domain/shape.
+    """
+
+    pos = state.pos
+    vel = _active_velocity(state)
+    n = state.N
+
+    dr = system.domain._displacement(pos[:, None, :], pos[None, :, :], system)
+    dv = vel[:, None, :] - vel[None, :, :]
+    radius = state.rad[:, None] + state.rad[None, :]
+    pair_times = _solve_collision_time(dr, dv, radius, min_dt, overlap_tol)
 
     iota = jnp.arange(n, dtype=int)
     valid_by_i = jax.vmap(
@@ -369,6 +435,173 @@ def event_step(
     return EventStepResult(state=state, system=system, event=event)
 
 
+def _next_correction_event(
+    state: State,
+    system: System,
+    remaining_dt: jax.Array,
+    min_dt: jax.Array,
+    overlap_tol: jax.Array,
+) -> tuple[Event, jax.Array]:
+    pair_time, pair_i, pair_j = _generic_pair_event(
+        state, system, min_dt, overlap_tol
+    )
+    wall_time, wall_i, wall_axis, wall_side = _wall_event(state, system, min_dt)
+
+    next_time = jnp.minimum(pair_time, wall_time)
+    hit = jnp.isfinite(next_time) & (next_time < remaining_dt)
+    is_pair = hit & (pair_time <= wall_time)
+    is_wall = hit & ~is_pair
+    none_i = jnp.asarray(-1, dtype=int)
+    event = Event(
+        time=jnp.where(hit, next_time, remaining_dt),
+        event_type=jnp.where(hit, jnp.where(is_pair, EVENT_PAIR, EVENT_WALL), EVENT_NONE),
+        i=jnp.where(hit, jnp.where(is_pair, pair_i, wall_i), none_i),
+        j=jnp.where(hit, jnp.where(is_pair, pair_j, wall_side), none_i),
+        axis=jnp.where(hit & is_wall, wall_axis, none_i),
+        hit=hit,
+    )
+    return event, next_time
+
+
+@jax.jit(static_argnames=("max_substeps",))
+def event_corrected_step(
+    state: State,
+    system: System,
+    *,
+    max_substeps: int = 8,
+    min_dt: float | jax.Array = 1e-12,
+    overlap_tol: float | jax.Array = 1e-10,
+    wall_restitution: Any = None,
+) -> EventCorrectedStepResult:
+    """Run one nominal ``system.dt`` step using event-aware substeps.
+
+    This is the broad-compatibility path for soft particles, clumps, facets,
+    bonded systems, custom force models, and arbitrary domains. It does not
+    replace the configured integrators or force models; each substep is just a
+    normal :meth:`System.step` with a smaller temporary ``dt``. When a
+    reflective-wall hit is predicted, the wrapper applies the same hard wall
+    impulse used by :func:`event_step`; pair contacts are handled by the
+    configured soft DEM force law over the subsequent substeps.
+
+    The method is a subdivision/correction heuristic, not exact universal
+    EDMD. Exact EDMD remains :func:`event_step` for independent hard spheres.
+    """
+
+    nominal_dt = system.dt
+    min_dt_arr = jnp.asarray(min_dt, dtype=state.pos.dtype)
+    overlap_tol_arr = jnp.asarray(overlap_tol, dtype=state.pos.dtype)
+    init_min = jnp.asarray(jnp.inf, dtype=state.pos.dtype)
+    wall_value = (
+        _default_wall_restitution(None, system)
+        if wall_restitution is None
+        else wall_restitution
+    )
+
+    init_carry = (
+        state,
+        system,
+        nominal_dt,
+        jnp.asarray(0, dtype=int),
+        init_min,
+        jnp.asarray(False),
+    )
+
+    def body(carry: tuple[Any, ...], _: None) -> tuple[tuple[Any, ...], None]:
+        st, sys, remaining, n_done, min_seen, any_hit = carry
+        active = remaining > min_dt_arr
+        slots_left = jnp.maximum(max_substeps - n_done, 1)
+        event, event_time = _next_correction_event(
+            st, sys, remaining, min_dt_arr, overlap_tol_arr
+        )
+
+        event_dt = jnp.clip(event_time, min_dt_arr, remaining)
+        post_hit_dt = remaining / slots_left.astype(remaining.dtype)
+        proposed_dt = jnp.where(any_hit, post_hit_dt, event_dt)
+        is_last_slot = slots_left <= 1
+        step_dt = jnp.where(is_last_slot, remaining, proposed_dt)
+        step_dt = jnp.where(active, jnp.clip(step_dt, 0.0, remaining), 0.0)
+
+        def do_step(_: None) -> tuple[Any, ...]:
+            step_sys = dataclasses.replace(sys, dt=step_dt)
+            new_st, new_sys = step_sys.step(st, step_sys)
+            wall_active = (
+                event.hit
+                & (event.event_type == EVENT_WALL)
+                & ~any_hit
+                & (step_dt == event_dt)
+            )
+            new_st, new_sys = _apply_wall_impulse(
+                new_st,
+                new_sys,
+                event.i,
+                event.axis,
+                wall_value,
+                wall_active,
+            )
+            new_sys = dataclasses.replace(new_sys, dt=nominal_dt)
+            return (
+                new_st,
+                new_sys,
+                remaining - step_dt,
+                n_done + 1,
+                jnp.minimum(min_seen, step_dt),
+                any_hit | event.hit,
+            )
+
+        def skip_step(_: None) -> tuple[Any, ...]:
+            return (st, sys, remaining, n_done, min_seen, any_hit)
+
+        return jax.lax.cond(active, do_step, skip_step, operand=None), None
+
+    final_carry, _ = jax.lax.scan(
+        body, init_carry, xs=None, length=max_substeps, unroll=1
+    )
+    state, system, _, n_done, min_seen, any_hit = final_carry
+    correction = EventCorrection(
+        n_substeps=n_done,
+        min_substep_dt=jnp.where(n_done > 0, min_seen, jnp.asarray(0.0)),
+        hit=any_hit,
+    )
+    return EventCorrectedStepResult(state=state, system=system, correction=correction)
+
+
+@jax.jit(static_argnames=("n_steps", "max_substeps", "unroll"))
+def event_corrected_rollout(
+    state: State,
+    system: System,
+    *,
+    n_steps: int,
+    max_substeps: int = 8,
+    min_dt: float | jax.Array = 1e-12,
+    overlap_tol: float | jax.Array = 1e-10,
+    wall_restitution: Any = None,
+    unroll: int = 2,
+) -> tuple[State, System, tuple[State, System, EventCorrection]]:
+    """Run ``n_steps`` event-corrected nominal steps and collect frames."""
+
+    def body(
+        carry: tuple[State, System], _: None
+    ) -> tuple[tuple[State, System], tuple[State, System, EventCorrection]]:
+        st, sys = carry
+        result = event_corrected_step(
+            st,
+            sys,
+            max_substeps=max_substeps,
+            min_dt=min_dt,
+            overlap_tol=overlap_tol,
+            wall_restitution=wall_restitution,
+        )
+        return (
+            result.state,
+            result.system,
+        ), (result.state, result.system, result.correction)
+
+    (state, system), traj = jax.lax.scan(
+        body, (state, system), xs=None, length=n_steps, unroll=unroll
+    )
+    return state, system, traj
+
+
 @jax.jit(static_argnames=("n_events", "unroll"))
 def event_rollout(
     state: State,
@@ -410,7 +643,11 @@ __all__ = [
     "EVENT_PAIR",
     "EVENT_WALL",
     "Event",
+    "EventCorrection",
+    "EventCorrectedStepResult",
     "EventStepResult",
+    "event_corrected_rollout",
+    "event_corrected_step",
     "event_rollout",
     "event_step",
     "validate_event_state",
