@@ -166,7 +166,7 @@ def _pair_event(state: State, system: System, min_dt: jax.Array, overlap_tol: ja
     iota = jnp.arange(n, dtype=int)
     valid_by_i = jax.vmap(
         lambda ci, bi: valid_interaction_mask(
-            ci, state.clump_id, bi, state.unique_id, system.interact_same_bond_id
+            ci, state.clump_id, bi, iota, system.interact_same_bond_id
         )
     )(state.clump_id, state.bond_id)
     valid_pairs = (
