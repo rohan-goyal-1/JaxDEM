@@ -27,6 +27,16 @@ from .dynamical_matrix import (
     zero_mode_mask,
 )
 from .dynamics_routines import run_packing_fraction_protocol
+from .event_dynamics import (
+    EVENT_NONE,
+    EVENT_PAIR,
+    EVENT_WALL,
+    Event,
+    EventStepResult,
+    event_rollout,
+    event_step,
+    validate_event_state,
+)
 from .environment import (
     cross_lidar_2d,
     cross_lidar_3d,
@@ -109,6 +119,13 @@ __all__ = [
     "encode_callable",
     "env_step",
     "env_trajectory_rollout",
+    "EVENT_NONE",
+    "EVENT_PAIR",
+    "EVENT_WALL",
+    "Event",
+    "EventStepResult",
+    "event_rollout",
+    "event_step",
     "generate_arclength_mesh",
     "generate_faceted_mesh",
     "generate_fibonacci_sphere_mesh",
@@ -148,5 +165,6 @@ __all__ = [
     "signed_angle_x",
     "unit",
     "unit_and_norm",
+    "validate_event_state",
     "zero_mode_mask",
 ]
