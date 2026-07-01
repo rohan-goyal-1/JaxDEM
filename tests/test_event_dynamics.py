@@ -186,6 +186,45 @@ def test_event_corrected_step_subdivides_after_predicted_contact():
     assert float(result.system.time) == pytest.approx(1.0)
 
 
+def test_event_corrected_step_uses_collider_candidate_list():
+    state, _ = _sphere_system(
+        [[0.0, 0.0], [3.0, 0.0]],
+        [[1.0, 0.0], [-1.0, 0.0]],
+    )
+    system = jdem.System.create(
+        state=state,
+        dt=1.0,
+        linear_integrator_type="verlet",
+        rotation_integrator_type="",
+        collider_type="cell_list",
+    )
+
+    result = event_corrected_step(state, system, max_substeps=4, max_neighbors=4)
+
+    assert bool(result.correction.hit)
+    assert not bool(result.correction.overflow)
+    assert int(result.correction.n_substeps) == 4
+    assert float(result.system.time) == pytest.approx(1.0)
+
+
+def test_event_corrected_step_reports_candidate_overflow():
+    state, _ = _sphere_system(
+        [[0.0, 0.0], [3.0, 0.0], [0.0, 3.0]],
+        [[1.0, 0.0], [-1.0, 0.0], [0.0, -1.0]],
+    )
+    system = jdem.System.create(
+        state=state,
+        dt=1.0,
+        linear_integrator_type="verlet",
+        rotation_integrator_type="",
+        collider_type="cell_list",
+    )
+
+    result = event_corrected_step(state, system, max_substeps=2, max_neighbors=1)
+
+    assert bool(result.correction.overflow)
+
+
 def test_event_corrected_rollout_is_jittable_and_accepts_clumps():
     state = jdem.State.create(
         pos=jnp.array([[0.0, 0.0], [1.0, 0.0]]),

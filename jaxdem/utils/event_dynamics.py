@@ -24,6 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from ..colliders import valid_interaction_mask
+from ..utils.linalg import cross_3X3D_1X2D
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..state import State
@@ -65,6 +66,7 @@ class EventCorrection(NamedTuple):
     n_substeps: jax.Array
     min_substep_dt: jax.Array
     hit: jax.Array
+    overflow: jax.Array
 
 
 class EventCorrectedStepResult(NamedTuple):
@@ -131,7 +133,8 @@ def validate_event_state(
 
 
 def _active_velocity(state: State) -> jax.Array:
-    return jnp.where(state.fixed[..., None], 0.0, state.vel)
+    vel = state.vel + cross_3X3D_1X2D(state.ang_vel, state._pos_p_rot)
+    return jnp.where(state.fixed[..., None], 0.0, vel)
 
 
 def _image_shifts(dim: int, periodic: bool) -> jax.Array:
@@ -248,6 +251,113 @@ def _generic_pair_event(
     pair_i = jnp.where(hit, flat_idx // n, -1)
     pair_j = jnp.where(hit, flat_idx % n, -1)
     return pair_time, pair_i, pair_j
+
+
+def _event_candidate_cutoff(
+    state: State,
+    remaining_dt: jax.Array,
+    candidate_cutoff: Any,
+    velocity_skin_factor: jax.Array,
+    overlap_tol: jax.Array,
+) -> jax.Array:
+    if candidate_cutoff is not None:
+        return jnp.asarray(candidate_cutoff, dtype=state.pos.dtype)
+
+    speed = jnp.linalg.norm(_active_velocity(state), axis=-1)
+    return (
+        2.0 * jnp.max(state._rad)
+        + velocity_skin_factor * jnp.max(speed) * remaining_dt
+        + overlap_tol
+    )
+
+
+def _neighbor_list_pair_event(
+    state: State,
+    system: System,
+    neighbors: jax.Array,
+    min_dt: jax.Array,
+    overlap_tol: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Approximate next sphere-bound contact over sparse collider candidates."""
+
+    n = state.N
+    max_neighbors = neighbors.shape[1]
+    if max_neighbors == 0:
+        return (
+            jnp.asarray(jnp.inf, dtype=state.pos.dtype),
+            jnp.asarray(-1, dtype=int),
+            jnp.asarray(-1, dtype=int),
+        )
+
+    pos = state.pos
+    vel = _active_velocity(state)
+    iota = jnp.arange(n, dtype=int)[:, None]
+    valid = neighbors != -1
+    safe_j = jnp.maximum(neighbors, 0)
+
+    dr = system.domain._displacement(pos[:, None, :], pos[safe_j], system)
+    dv = vel[:, None, :] - vel[safe_j]
+    radius = state.rad[:, None] + state.rad[safe_j]
+    pair_times = _solve_collision_time(dr, dv, radius, min_dt, overlap_tol)
+
+    valid_interaction = valid_interaction_mask(
+        state.clump_id[:, None],
+        state.clump_id[safe_j],
+        state.bond_id[:, None, :],
+        safe_j,
+        system.interact_same_bond_id,
+    )
+    valid_pairs = (
+        valid
+        & (iota < safe_j)
+        & (valid_interaction > 0)
+        & ~(state.fixed[:, None] & state.fixed[safe_j])
+    )
+    pair_times = jnp.where(valid_pairs, pair_times, jnp.inf)
+
+    flat_times = pair_times.reshape(-1)
+    flat_idx = jnp.argmin(flat_times)
+    pair_time = flat_times[flat_idx]
+    hit = jnp.isfinite(pair_time)
+    flat_j = safe_j.reshape(-1)[flat_idx]
+    pair_i = jnp.where(hit, flat_idx // max_neighbors, -1)
+    pair_j = jnp.where(hit, flat_j, -1)
+    return pair_time, pair_i, pair_j
+
+
+def _collider_pair_event(
+    state: State,
+    system: System,
+    remaining_dt: jax.Array,
+    min_dt: jax.Array,
+    overlap_tol: jax.Array,
+    candidate_cutoff: Any,
+    max_neighbors: int,
+    velocity_skin_factor: jax.Array,
+) -> tuple[State, System, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Predict pair events using the configured collider as the broad phase."""
+
+    collider_key = _normalize_type_name(system.collider.type_name)
+    if collider_key in {"", "naive"}:
+        pair_time, pair_i, pair_j = _generic_pair_event(
+            state, system, min_dt, overlap_tol
+        )
+        return state, system, pair_time, pair_i, pair_j, jnp.asarray(False)
+
+    cutoff = _event_candidate_cutoff(
+        state,
+        remaining_dt,
+        candidate_cutoff,
+        velocity_skin_factor,
+        overlap_tol,
+    )
+    state, system, neighbors, overflow = system.collider.create_neighbor_list(
+        state, system, cutoff, max_neighbors
+    )
+    pair_time, pair_i, pair_j = _neighbor_list_pair_event(
+        state, system, neighbors, min_dt, overlap_tol
+    )
+    return state, system, pair_time, pair_i, pair_j, overflow
 
 
 def _wall_event(
@@ -441,9 +551,19 @@ def _next_correction_event(
     remaining_dt: jax.Array,
     min_dt: jax.Array,
     overlap_tol: jax.Array,
-) -> tuple[Event, jax.Array]:
-    pair_time, pair_i, pair_j = _generic_pair_event(
-        state, system, min_dt, overlap_tol
+    candidate_cutoff: Any,
+    max_neighbors: int,
+    velocity_skin_factor: jax.Array,
+) -> tuple[State, System, Event, jax.Array, jax.Array]:
+    state, system, pair_time, pair_i, pair_j, overflow = _collider_pair_event(
+        state,
+        system,
+        remaining_dt,
+        min_dt,
+        overlap_tol,
+        candidate_cutoff,
+        max_neighbors,
+        velocity_skin_factor,
     )
     wall_time, wall_i, wall_axis, wall_side = _wall_event(state, system, min_dt)
 
@@ -460,10 +580,10 @@ def _next_correction_event(
         axis=jnp.where(hit & is_wall, wall_axis, none_i),
         hit=hit,
     )
-    return event, next_time
+    return state, system, event, next_time, overflow
 
 
-@jax.jit(static_argnames=("max_substeps",))
+@jax.jit(static_argnames=("max_substeps", "max_neighbors"))
 def event_corrected_step(
     state: State,
     system: System,
@@ -472,6 +592,9 @@ def event_corrected_step(
     min_dt: float | jax.Array = 1e-12,
     overlap_tol: float | jax.Array = 1e-10,
     wall_restitution: Any = None,
+    candidate_cutoff: float | jax.Array | None = None,
+    max_neighbors: int = 64,
+    velocity_skin_factor: float | jax.Array = 2.0,
 ) -> EventCorrectedStepResult:
     """Run one nominal ``system.dt`` step using event-aware substeps.
 
@@ -483,6 +606,14 @@ def event_corrected_step(
     impulse used by :func:`event_step`; pair contacts are handled by the
     configured soft DEM force law over the subsequent substeps.
 
+    Pair-event prediction uses the configured collider as a broad phase when
+    possible. ``NeighborList`` reuses its cached list, while ``CellList`` and
+    ``MultiCellList`` build sparse candidates with a swept cutoff. Systems
+    with the empty no-op or naive colliders fall back to the dense reference
+    predictor. ``correction.overflow`` indicates that a candidate buffer
+    overflowed and ``max_neighbors`` or the collider's own neighbor-list
+    capacity should be increased.
+
     The method is a subdivision/correction heuristic, not exact universal
     EDMD. Exact EDMD remains :func:`event_step` for independent hard spheres.
     """
@@ -490,6 +621,7 @@ def event_corrected_step(
     nominal_dt = system.dt
     min_dt_arr = jnp.asarray(min_dt, dtype=state.pos.dtype)
     overlap_tol_arr = jnp.asarray(overlap_tol, dtype=state.pos.dtype)
+    velocity_skin_factor_arr = jnp.asarray(velocity_skin_factor, dtype=state.pos.dtype)
     init_min = jnp.asarray(jnp.inf, dtype=state.pos.dtype)
     wall_value = (
         _default_wall_restitution(None, system)
@@ -504,14 +636,22 @@ def event_corrected_step(
         jnp.asarray(0, dtype=int),
         init_min,
         jnp.asarray(False),
+        jnp.asarray(False),
     )
 
     def body(carry: tuple[Any, ...], _: None) -> tuple[tuple[Any, ...], None]:
-        st, sys, remaining, n_done, min_seen, any_hit = carry
+        st, sys, remaining, n_done, min_seen, any_hit, any_overflow = carry
         active = remaining > min_dt_arr
         slots_left = jnp.maximum(max_substeps - n_done, 1)
-        event, event_time = _next_correction_event(
-            st, sys, remaining, min_dt_arr, overlap_tol_arr
+        st, sys, event, event_time, overflow = _next_correction_event(
+            st,
+            sys,
+            remaining,
+            min_dt_arr,
+            overlap_tol_arr,
+            candidate_cutoff,
+            max_neighbors,
+            velocity_skin_factor_arr,
         )
 
         event_dt = jnp.clip(event_time, min_dt_arr, remaining)
@@ -546,26 +686,30 @@ def event_corrected_step(
                 n_done + 1,
                 jnp.minimum(min_seen, step_dt),
                 any_hit | event.hit,
+                any_overflow | overflow,
             )
 
         def skip_step(_: None) -> tuple[Any, ...]:
-            return (st, sys, remaining, n_done, min_seen, any_hit)
+            return (st, sys, remaining, n_done, min_seen, any_hit, any_overflow)
 
         return jax.lax.cond(active, do_step, skip_step, operand=None), None
 
     final_carry, _ = jax.lax.scan(
         body, init_carry, xs=None, length=max_substeps, unroll=1
     )
-    state, system, _, n_done, min_seen, any_hit = final_carry
+    state, system, _, n_done, min_seen, any_hit, any_overflow = final_carry
     correction = EventCorrection(
         n_substeps=n_done,
-        min_substep_dt=jnp.where(n_done > 0, min_seen, jnp.asarray(0.0)),
+        min_substep_dt=jnp.where(
+            n_done > 0, min_seen, jnp.asarray(0.0, dtype=state.pos.dtype)
+        ),
         hit=any_hit,
+        overflow=any_overflow,
     )
     return EventCorrectedStepResult(state=state, system=system, correction=correction)
 
 
-@jax.jit(static_argnames=("n_steps", "max_substeps", "unroll"))
+@jax.jit(static_argnames=("n_steps", "max_substeps", "max_neighbors", "unroll"))
 def event_corrected_rollout(
     state: State,
     system: System,
@@ -575,6 +719,9 @@ def event_corrected_rollout(
     min_dt: float | jax.Array = 1e-12,
     overlap_tol: float | jax.Array = 1e-10,
     wall_restitution: Any = None,
+    candidate_cutoff: float | jax.Array | None = None,
+    max_neighbors: int = 64,
+    velocity_skin_factor: float | jax.Array = 2.0,
     unroll: int = 2,
 ) -> tuple[State, System, tuple[State, System, EventCorrection]]:
     """Run ``n_steps`` event-corrected nominal steps and collect frames."""
@@ -590,6 +737,9 @@ def event_corrected_rollout(
             min_dt=min_dt,
             overlap_tol=overlap_tol,
             wall_restitution=wall_restitution,
+            candidate_cutoff=candidate_cutoff,
+            max_neighbors=max_neighbors,
+            velocity_skin_factor=velocity_skin_factor,
         )
         return (
             result.state,
