@@ -21,14 +21,18 @@ from jaxdem.utils import (
 )
 
 
-def _sphere_system(pos, vel, rad=None, mass=None, *, domain_type="free", domain_kw=None):
+def _sphere_system(
+    pos, vel, rad=None, mass=None, *, domain_type="free", domain_kw=None
+):
     pos = jnp.asarray(pos, dtype=float)
     n = pos.shape[0]
     state = jdem.State.create(
         pos=pos,
         vel=jnp.asarray(vel, dtype=float),
         rad=jnp.ones(n, dtype=float) if rad is None else jnp.asarray(rad, dtype=float),
-        mass=jnp.ones(n, dtype=float) if mass is None else jnp.asarray(mass, dtype=float),
+        mass=(
+            jnp.ones(n, dtype=float) if mass is None else jnp.asarray(mass, dtype=float)
+        ),
     )
     system = jdem.System.create(
         state.shape,

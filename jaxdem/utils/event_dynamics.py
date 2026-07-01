@@ -166,7 +166,9 @@ def _solve_collision_time(
     return jnp.where(valid, t, jnp.inf)
 
 
-def _pair_event(state: State, system: System, min_dt: jax.Array, overlap_tol: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+def _pair_event(
+    state: State, system: System, min_dt: jax.Array, overlap_tol: jax.Array
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     pos = state.pos
     vel = _active_velocity(state)
     n = state.N
@@ -401,7 +403,9 @@ def _wall_event(
     )
 
 
-def _select_pair_value(value: Any, state: State, system: System, i: jax.Array, j: jax.Array) -> jax.Array:
+def _select_pair_value(
+    value: Any, state: State, system: System, i: jax.Array, j: jax.Array
+) -> jax.Array:
     if value is None:
         if hasattr(system.mat_table, "e_eff"):
             arr = system.mat_table.e_eff
@@ -462,8 +466,12 @@ def _apply_pair_impulse(
     inv_mass_sum = inv_mass_i + inv_mass_j
     v_rel_n = jnp.dot(vel[safe_i] - vel[safe_j], normal)
     e = _select_pair_value(restitution, state, system, safe_i, safe_j)
-    impulse_mag = -(1.0 + e) * v_rel_n / jnp.where(inv_mass_sum > 0.0, inv_mass_sum, 1.0)
-    impulse_mag = jnp.where(active & (inv_mass_sum > 0.0) & (v_rel_n < 0.0), impulse_mag, 0.0)
+    impulse_mag = (
+        -(1.0 + e) * v_rel_n / jnp.where(inv_mass_sum > 0.0, inv_mass_sum, 1.0)
+    )
+    impulse_mag = jnp.where(
+        active & (inv_mass_sum > 0.0) & (v_rel_n < 0.0), impulse_mag, 0.0
+    )
     impulse = impulse_mag * normal
 
     state.vel = state.vel.at[safe_i].add(inv_mass_i * impulse)
@@ -517,15 +525,27 @@ def event_step(
     dt = jnp.where(
         hit,
         next_time,
-        jnp.where(jnp.isfinite(max_dt_arr), max_dt_arr, jnp.asarray(0.0, dtype=state.pos.dtype)),
+        jnp.where(
+            jnp.isfinite(max_dt_arr),
+            max_dt_arr,
+            jnp.asarray(0.0, dtype=state.pos.dtype),
+        ),
     )
     is_pair = hit & (pair_time <= wall_time)
     is_wall = hit & ~is_pair
 
     state, system = _advance_ballistic(state, system, dt)
-    state, system = _apply_pair_impulse(state, system, pair_i, pair_j, restitution, is_pair)
-    wall_value = _default_wall_restitution(restitution, system) if wall_restitution is None else wall_restitution
-    state, system = _apply_wall_impulse(state, system, wall_i, wall_axis, wall_value, is_wall)
+    state, system = _apply_pair_impulse(
+        state, system, pair_i, pair_j, restitution, is_pair
+    )
+    wall_value = (
+        _default_wall_restitution(restitution, system)
+        if wall_restitution is None
+        else wall_restitution
+    )
+    state, system = _apply_wall_impulse(
+        state, system, wall_i, wall_axis, wall_value, is_wall
+    )
 
     system = dataclasses.replace(
         system,
@@ -536,7 +556,9 @@ def event_step(
     none_i = jnp.asarray(-1, dtype=int)
     event = Event(
         time=dt,
-        event_type=jnp.where(hit, jnp.where(is_pair, EVENT_PAIR, EVENT_WALL), EVENT_NONE),
+        event_type=jnp.where(
+            hit, jnp.where(is_pair, EVENT_PAIR, EVENT_WALL), EVENT_NONE
+        ),
         i=jnp.where(hit, jnp.where(is_pair, pair_i, wall_i), none_i),
         j=jnp.where(hit, jnp.where(is_pair, pair_j, wall_side), none_i),
         axis=jnp.where(hit & is_wall, wall_axis, none_i),
@@ -574,7 +596,9 @@ def _next_correction_event(
     none_i = jnp.asarray(-1, dtype=int)
     event = Event(
         time=jnp.where(hit, next_time, remaining_dt),
-        event_type=jnp.where(hit, jnp.where(is_pair, EVENT_PAIR, EVENT_WALL), EVENT_NONE),
+        event_type=jnp.where(
+            hit, jnp.where(is_pair, EVENT_PAIR, EVENT_WALL), EVENT_NONE
+        ),
         i=jnp.where(hit, jnp.where(is_pair, pair_i, wall_i), none_i),
         j=jnp.where(hit, jnp.where(is_pair, pair_j, wall_side), none_i),
         axis=jnp.where(hit & is_wall, wall_axis, none_i),
@@ -780,7 +804,11 @@ def event_rollout(
             min_dt=min_dt,
             overlap_tol=overlap_tol,
         )
-        return (result.state, result.system), (result.state, result.system, result.event)
+        return (result.state, result.system), (
+            result.state,
+            result.system,
+            result.event,
+        )
 
     (state, system), traj = jax.lax.scan(
         body, (state, system), xs=None, length=n_events, unroll=unroll
